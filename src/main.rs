@@ -4,8 +4,8 @@ use futures::select;
 use log::*;
 use macos_routing_table::RoutingTable;
 use serde::Deserialize;
-use std::net::IpAddr;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use structopt::StructOpt;
 use tokio::{
     net::UdpSocket,
@@ -27,7 +27,7 @@ struct Config {
     bind_address: Option<SocketAddrV4>,
     default_dns_address: Option<SocketAddrV4>,
     default_network_interface: String,
-    alternate_networks: Vec<AltNet>,
+    alternate_networks: HashMap<String, AltNet>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,18 +97,20 @@ async fn main() -> Result<()> {
     //
     // Ensure there's a route to DNS servers for alternative networks
     //
-    for altnet in &config.alternate_networks {
+    for (net_name, altnet) in &config.alternate_networks {
         let dns_addr = IpAddr::from(*altnet.dns_address.ip());
         if let Some(cur_if) = rt.find_gateway_netif(dns_addr) {
             if cur_if == altnet.network_interface {
                 info!(
-                    "DNS requests for {} are already routed through {}",
+                    "DNS requests for {} ({}) are already routed through {}",
+                    net_name,
                     altnet.dns_address.ip(),
                     altnet.network_interface
                 );
             } else {
                 warn!(
-                    "DNS requests for {} are NOT routed through {}",
+                    "DNS requests for {} ({}) are NOT routed through {}",
+                    net_name,
                     altnet.dns_address.ip(),
                     altnet.network_interface
                 );
@@ -325,7 +327,7 @@ async fn handle_request(
 fn inspect<'a>(
     default_dns_address: SocketAddrV4,
     default_net_if: &'a str,
-    altnets: &'a [AltNet],
+    altnets: &'a HashMap<String, AltNet>,
     buf: &[u8],
 ) -> Result<(SocketAddrV4, &'a str, Option<String>)> {
     debug!("Inspecting {:?}", buf);
@@ -336,7 +338,7 @@ fn inspect<'a>(
     for question in query.questions {
         debug!("domain_name = {:?}", question.domain_name);
         let this_domain_name: String = question.domain_name.into();
-        for altnet in altnets {
+        for altnet in altnets.values() {
             if altnet
                 .domains
                 .iter()

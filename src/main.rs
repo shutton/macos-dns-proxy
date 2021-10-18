@@ -56,7 +56,7 @@ enum RTRequest {
     // Query the gateway address for routing an address across a given interface
     QueryGw {
         net_if: String,
-        addr: IpAddr,
+        ipaddr: IpAddr,
         reply_tx: oneshot::Sender<Option<IpAddr>>,
     },
 }
@@ -122,9 +122,7 @@ async fn main() -> Result<()> {
     }
 
     let (rt_tx, rt_rx) = mpsc::channel(32);
-    tokio::spawn(rt_server(rt_rx));
-    // Load the initial routing table
-    rt_tx.send(RTRequest::Replace(rt)).await?;
+    tokio::spawn(rt_server(rt_rx, rt));
 
     let (dns_tx, mut dns_rx) = mpsc::channel(32);
     let (dns_reply_tx, dns_reply_rx) = mpsc::channel(32);
@@ -185,36 +183,30 @@ async fn dns_server<T: tokio::net::ToSocketAddrs + std::fmt::Debug>(
 
 /// The routing table server.  Holds a routing table, and performs queries
 /// against it, as well as allowing its replacement.
-async fn rt_server(mut rx: mpsc::Receiver<RTRequest>) -> Result<()> {
-    let mut rt = None;
+async fn rt_server(mut rx: mpsc::Receiver<RTRequest>, mut rt: RoutingTable) -> Result<()> {
     let mut cache = lru::LruCache::new(1024);
     while let Some(query) = rx.recv().await {
         match query {
-            RTRequest::Replace(new_rt) => rt = Some(new_rt),
+            RTRequest::Replace(new_rt) => {
+                rt = new_rt;
+                cache.clear();
+            }
             RTRequest::Query { ipaddr, reply_tx } => {
-                if let Some(rt) = &rt {
-                    let entry = cache.get(&ipaddr).or_else(|| rt.find_route_entry(ipaddr));
-                    if let Some(entry) = entry {
-                        reply_tx.send(Some(entry.net_if.to_owned())).unwrap();
-                        let entry = entry.clone();
-                        cache.put(ipaddr, entry);
-                    } else {
-                        reply_tx.send(None).unwrap();
-                    }
+                let entry = cache.get(&ipaddr).or_else(|| rt.find_route_entry(ipaddr));
+                if let Some(entry) = entry {
+                    reply_tx.send(Some(entry.net_if.to_owned())).unwrap();
+                    let entry = entry.clone();
+                    cache.put(ipaddr, entry);
+                } else {
+                    reply_tx.send(None).unwrap();
                 }
             }
             RTRequest::QueryGw {
                 net_if,
-                addr,
+                ipaddr,
                 reply_tx,
             } => {
-                reply_tx
-                    .send(
-                        rt.as_ref()
-                            .map(|rt| query_gateway(rt, &net_if, &addr))
-                            .flatten(),
-                    )
-                    .unwrap();
+                reply_tx.send(query_gateway(&rt, &net_if, &ipaddr)).unwrap();
             }
         }
     }
@@ -259,7 +251,7 @@ async fn handle_request(
                             rt_tx
                                 .send(RTRequest::QueryGw {
                                     net_if: route_through_if.clone(),
-                                    addr: IpAddr::V4(a.ipv4_addr),
+                                    ipaddr: IpAddr::V4(a.ipv4_addr),
                                     reply_tx,
                                 })
                                 .await?;

@@ -6,6 +6,7 @@ use macos_routing_table::RoutingTable;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+use std::process::Stdio;
 use structopt::StructOpt;
 use tokio::{
     net::UdpSocket,
@@ -277,10 +278,8 @@ async fn handle_request(
                                     // Remove it after a minute
                                     // FIXME: make it the TTL of the record or longer
                                     tokio::spawn(async move {
-                                        tokio::time::sleep(std::time::Duration::from_secs(
-                                            a.ttl as u64,
-                                        ))
-                                        .await;
+                                        let delay = std::time::Duration::from_secs(a.ttl as u64);
+                                        tokio::time::sleep(delay).await;
                                         if let Err(e) =
                                             update_route("delete", a.ipv4_addr.into(), gw_addr)
                                                 .await
@@ -288,8 +287,8 @@ async fn handle_request(
                                             warn!("failed to remove route: {}", e);
                                         } else {
                                             info!(
-                                                "removed route for {} ({}) via {:?}",
-                                                req_domain, a.ipv4_addr, gw_addr
+                                                "removed route for {} ({}) via {:?} after {:?}",
+                                                req_domain, a.ipv4_addr, gw_addr, delay
                                             );
                                             let new_rt =
                                                 RoutingTable::load_from_netstat().await.unwrap();
@@ -302,7 +301,7 @@ async fn handle_request(
                             }
                         } else {
                             info!(
-                                "Route {} ({}) via {}",
+                                "routing {:?} ({}) via {}",
                                 req_domain, a.ipv4_addr, route_through_if
                             );
                         }
@@ -354,21 +353,25 @@ fn ipaddr_same_proto(left: &IpAddr, right: &IpAddr) -> bool {
 }
 
 async fn update_route(operation: &str, dest: IpAddr, gw_addr: IpAddr) -> Result<()> {
-    let mut child = Command::new("/sbin/route")
+    let output = Command::new("/sbin/route")
         .arg(operation)
         .arg(format!("{}", dest))
         .arg(gw_addr.to_string())
-        .spawn()?;
-    let status = child.wait().await?;
-    if status.success() {
+        .stdout(Stdio::null())
+        .output()
+        .await?;
+    if output.status.success() {
         Ok(())
     } else {
+        let stderr =
+            String::from_utf8(output.stderr).unwrap_or_else(|_| "non-UTF-8 stderr".to_owned());
         Err(anyhow!(
-            "route {} {:?} {:?} exited with {}",
+            "route {} {:?} {:?} exited with {}, err: {}",
             operation,
             dest,
             gw_addr,
-            status
+            output.status,
+            stderr
         ))
     }
 }

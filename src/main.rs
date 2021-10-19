@@ -257,44 +257,26 @@ async fn handle_request(
                                 })
                                 .await?;
                             if let Ok(Some(gw_addr)) = reply_rx.await {
-                                warn!(
-                                    "Need to add a route for {} ({}) via {:?}! for {:?}",
-                                    req_domain,
-                                    a.ipv4_addr,
-                                    gw_addr,
-                                    std::time::Duration::from_secs(a.ttl as u64)
+                                debug!(
+                                    "adding a route for {} ({}) via {:?}!",
+                                    req_domain, a.ipv4_addr, gw_addr,
                                 );
                                 // Compute a time slot to expire this entry.
                                 // Every ten minutes, we drop all the routes that were created at least an hour ago.
+                                //
+                                // NOTE: Routes don't expire. We have no idea how long a connection may require them, how long the
+                                //       DNS entry will be cached (before we see it again), etc.
                                 if let Err(e) =
                                     update_route("add", a.ipv4_addr.into(), gw_addr).await
                                 {
                                     warn!("failed to add route: {}", e);
                                 } else {
+                                    info!(
+                                        "routing {:?} ({}) via {} (NEW)",
+                                        req_domain, a.ipv4_addr, route_through_if
+                                    );
                                     let new_rt = RoutingTable::load_from_netstat().await?;
                                     rt_tx.send(RTRequest::Replace(new_rt)).await?;
-                                    let req_domain = req_domain.clone();
-                                    let rt_tx = rt_tx.clone();
-                                    // Remove it after a minute
-                                    // FIXME: make it the TTL of the record or longer
-                                    tokio::spawn(async move {
-                                        let delay = std::time::Duration::from_secs(a.ttl as u64);
-                                        tokio::time::sleep(delay).await;
-                                        if let Err(e) =
-                                            update_route("delete", a.ipv4_addr.into(), gw_addr)
-                                                .await
-                                        {
-                                            warn!("failed to remove route: {}", e);
-                                        } else {
-                                            info!(
-                                                "removed route for {} ({}) via {:?} after {:?}",
-                                                req_domain, a.ipv4_addr, gw_addr, delay
-                                            );
-                                            let new_rt =
-                                                RoutingTable::load_from_netstat().await.unwrap();
-                                            rt_tx.send(RTRequest::Replace(new_rt)).await.unwrap();
-                                        };
-                                    });
                                 }
                             } else {
                                 warn!("Couldn't get a route for {} ({})!", req_domain, a.ipv4_addr)

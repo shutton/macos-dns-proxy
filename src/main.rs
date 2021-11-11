@@ -7,7 +7,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::process::Stdio;
+use std::time::Duration;
 use structopt::StructOpt;
+use tokio::time::timeout;
 use tokio::{
     net::UdpSocket,
     process::Command,
@@ -132,15 +134,17 @@ async fn main() -> Result<()> {
     loop {
         while let Some((request, addr)) = dns_rx.recv().await {
             debug!("Received {} bytes from {:?}", request.len(), addr);
-            let (dns_addr, route_through_if, req_domain) = inspect(
+            let (dns_addr, altnet_name, route_through_if, req_domain) = inspect(
                 default_dns_address,
                 &default_net_if,
                 &config.alternate_networks,
                 &request,
             )?;
             let rt_tx = rt_tx.clone();
+            let altnet_name = altnet_name.to_string();
             tokio::spawn(handle_request(
                 dns_addr,
+                altnet_name,
                 request,
                 req_domain,
                 rt_tx,
@@ -217,6 +221,7 @@ async fn rt_server(mut rx: mpsc::Receiver<RTRequest>, mut rt: RoutingTable) -> R
 // TODO: this needs to be multiplexed to reduce the number of bind()'s.
 async fn handle_request(
     dns_addr: SocketAddrV4,
+    altnet_name: String,
     request: Vec<u8>,
     req_domain: Option<String>,
     rt_tx: mpsc::Sender<RTRequest>,
@@ -229,7 +234,21 @@ async fn handle_request(
     debug!("Querying {}", &dns_addr);
     local_server.send_to(&request, dns_addr).await?;
     let mut reply = [0u8; 512];
-    let len = local_server.recv(&mut reply).await?;
+    let len =
+        if let Ok(reply) = timeout(Duration::from_secs(5), local_server.recv(&mut reply)).await {
+            match reply {
+                Ok(reply) => reply,
+                Err(e) => {
+                    warn!("Failed getting reply from {}: {}", &dns_addr, e);
+                    return Err(anyhow!("io error: {}", e));
+                }
+            }
+        } else {
+            warn!("Timed out waiting for reply from {}", &dns_addr);
+            return Err(anyhow!("timeout"));
+        };
+    // Free up the socket as quickly as possible
+    drop(local_server);
 
     if let Some(req_domain) = req_domain {
         // Now check the reply and make sure it will use the expected interface
@@ -238,53 +257,56 @@ async fn handle_request(
         if let Ok(reply) = reply_dns {
             for rr in reply.answers {
                 // Just handle A records for now.  Ignore AAAA and others.
-                if let dns_message_parser::rr::RR::A(a) = rr {
+                let (addr, qtype) = match &rr {
+                    dns_message_parser::rr::RR::A(addr) => {
+                        (Some(IpAddr::from(addr.ipv4_addr)), "A")
+                    }
+                    dns_message_parser::rr::RR::AAAA(addr) => {
+                        (Some(IpAddr::from(addr.ipv6_addr)), "AAAA")
+                    }
+                    _ => (None, "N/A"),
+                };
+                debug!("DNS({}):{:?} {:?}", altnet_name, dns_addr, rr);
+                if let Some(ipaddr) = addr {
                     let (reply_tx, reply_rx) = oneshot::channel();
-                    rt_tx
-                        .send(RTRequest::Query {
-                            ipaddr: IpAddr::V4(a.ipv4_addr),
-                            reply_tx,
-                        })
-                        .await?;
+                    rt_tx.send(RTRequest::Query { ipaddr, reply_tx }).await?;
                     if let Ok(Some(net_if)) = reply_rx.await {
                         if route_through_if != net_if {
                             let (reply_tx, reply_rx) = oneshot::channel();
                             rt_tx
                                 .send(RTRequest::QueryGw {
                                     net_if: route_through_if.clone(),
-                                    ipaddr: IpAddr::V4(a.ipv4_addr),
+                                    ipaddr,
                                     reply_tx,
                                 })
                                 .await?;
                             if let Ok(Some(gw_addr)) = reply_rx.await {
                                 debug!(
                                     "adding a route for {} ({}) via {:?}!",
-                                    req_domain, a.ipv4_addr, gw_addr,
+                                    req_domain, ipaddr, gw_addr,
                                 );
                                 // Compute a time slot to expire this entry.
                                 // Every ten minutes, we drop all the routes that were created at least an hour ago.
                                 //
                                 // NOTE: Routes don't expire. We have no idea how long a connection may require them, how long the
                                 //       DNS entry will be cached (before we see it again), etc.
-                                if let Err(e) =
-                                    update_route("add", a.ipv4_addr.into(), gw_addr).await
-                                {
+                                if let Err(e) = update_route("add", ipaddr, gw_addr).await {
                                     warn!("failed to add route: {}", e);
                                 } else {
                                     info!(
-                                        "routing {:?} ({}) via {} (NEW)",
-                                        req_domain, a.ipv4_addr, route_through_if
+                                        "routing {}:{} -> {} via {}({}) (NEW)",
+                                        qtype, req_domain, ipaddr, route_through_if, altnet_name
                                     );
                                     let new_rt = RoutingTable::load_from_netstat().await?;
                                     rt_tx.send(RTRequest::Replace(new_rt)).await?;
                                 }
                             } else {
-                                warn!("Couldn't get a route for {} ({})!", req_domain, a.ipv4_addr)
+                                debug!("no route for {} {} -> {}!", qtype, req_domain, ipaddr)
                             }
                         } else {
                             info!(
-                                "routing {:?} ({}) via {}",
-                                req_domain, a.ipv4_addr, route_through_if
+                                "routing {}:{} -> {} via {}({})",
+                                qtype, req_domain, ipaddr, route_through_if, altnet_name,
                             );
                         }
                     }
@@ -302,7 +324,7 @@ fn inspect<'a>(
     default_net_if: &'a str,
     altnets: &'a HashMap<String, AltNet>,
     buf: &[u8],
-) -> Result<(SocketAddrV4, &'a str, Option<String>)> {
+) -> Result<(SocketAddrV4, &'a str, &'a str, Option<String>)> {
     debug!("Inspecting {:?}", buf);
     let msg = bytes::Bytes::copy_from_slice(buf);
     let query = dns_message_parser::Dns::decode(msg)?;
@@ -311,7 +333,7 @@ fn inspect<'a>(
     for question in query.questions {
         debug!("domain_name = {:?}", question.domain_name);
         let this_domain_name: String = question.domain_name.into();
-        for altnet in altnets.values() {
+        for (altnet_name, altnet) in altnets {
             if altnet
                 .domains
                 .iter()
@@ -319,6 +341,7 @@ fn inspect<'a>(
             {
                 return Ok((
                     altnet.dns_address,
+                    altnet_name,
                     &altnet.network_interface,
                     Some(this_domain_name),
                 ));
@@ -327,7 +350,7 @@ fn inspect<'a>(
         domain_name = Some(this_domain_name);
     }
 
-    Ok((default_dns_address, default_net_if, domain_name))
+    Ok((default_dns_address, "default", default_net_if, domain_name))
 }
 
 fn ipaddr_same_proto(left: &IpAddr, right: &IpAddr) -> bool {

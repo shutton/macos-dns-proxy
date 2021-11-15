@@ -1,11 +1,14 @@
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use futures::future::FutureExt;
 use futures::select;
 use log::*;
 use macos_routing_table::RoutingTable;
+use nix::sys::socket::{self, sockopt::ReusePort};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+use std::os::unix::io::AsRawFd;
 use std::process::Stdio;
 use std::time::Duration;
 use structopt::StructOpt;
@@ -31,6 +34,18 @@ struct Config {
     default_dns_address: Option<SocketAddrV4>,
     default_network_interface: String,
     alternate_networks: HashMap<String, AltNet>,
+}
+
+struct ProxyRequest {
+    dns_addr: SocketAddrV4,
+    altnet_name: String,
+    request: Vec<u8>,
+    req_domain: Option<String>,
+    rt_tx: mpsc::Sender<RTRequest>,
+    route_through_if: String,
+    dns_reply_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    addr: SocketAddr,
+    sockpool: deadpool::managed::Pool<UdpSocketPool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +146,11 @@ async fn main() -> Result<()> {
     let (dns_reply_tx, dns_reply_rx) = mpsc::channel(32);
     tokio::spawn(dns_server(bind_addr, dns_tx, dns_reply_rx));
 
+    let sockpool = deadpool::managed::Pool::builder(UdpSocketPool)
+        .max_size(16)
+        .build()
+        .unwrap();
+
     loop {
         while let Some((request, addr)) = dns_rx.recv().await {
             debug!("Received {} bytes from {:?}", request.len(), addr);
@@ -142,16 +162,18 @@ async fn main() -> Result<()> {
             )?;
             let rt_tx = rt_tx.clone();
             let altnet_name = altnet_name.to_string();
-            tokio::spawn(handle_request(
+            let sockpool = sockpool.clone();
+            tokio::spawn(handle_request(ProxyRequest {
                 dns_addr,
                 altnet_name,
                 request,
                 req_domain,
                 rt_tx,
-                route_through_if.to_owned(),
-                dns_reply_tx.clone(),
+                route_through_if: route_through_if.to_owned(),
+                dns_reply_tx: dns_reply_tx.clone(),
                 addr,
-            ));
+                sockpool,
+            }));
         }
     }
 }
@@ -218,39 +240,31 @@ async fn rt_server(mut rx: mpsc::Receiver<RTRequest>, mut rt: RoutingTable) -> R
     Ok(())
 }
 
-// TODO: this needs to be multiplexed to reduce the number of bind()'s.
-async fn handle_request(
-    dns_addr: SocketAddrV4,
-    altnet_name: String,
-    request: Vec<u8>,
-    req_domain: Option<String>,
-    rt_tx: mpsc::Sender<RTRequest>,
-    route_through_if: String,
-    dns_reply_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    addr: SocketAddr,
-) -> Result<()> {
-    // Establish a local respose port
-    let local_server = UdpSocket::bind("0.0.0.0:0").await?;
-    debug!("Querying {}", &dns_addr);
-    local_server.send_to(&request, dns_addr).await?;
+async fn handle_request(req: ProxyRequest) -> Result<()> {
+    // Establish a local response port
+    let local_server = req.sockpool.get().await.unwrap();
+    debug!(
+        "Querying {} from {:?}",
+        &req.dns_addr,
+        local_server.local_addr()
+    );
+    local_server.send_to(&req.request, req.dns_addr).await?;
     let mut reply = [0u8; 512];
     let len =
         if let Ok(reply) = timeout(Duration::from_secs(5), local_server.recv(&mut reply)).await {
             match reply {
                 Ok(reply) => reply,
                 Err(e) => {
-                    warn!("Failed getting reply from {}: {}", &dns_addr, e);
+                    warn!("Failed getting reply from {}: {}", &req.dns_addr, e);
                     return Err(anyhow!("io error: {}", e));
                 }
             }
         } else {
-            warn!("Timed out waiting for reply from {}", &dns_addr);
+            warn!("Timed out waiting for reply from {}", &req.dns_addr);
             return Err(anyhow!("timeout"));
         };
-    // Free up the socket as quickly as possible
-    drop(local_server);
 
-    if let Some(req_domain) = req_domain {
+    if let Some(req_domain) = req.req_domain {
         // Now check the reply and make sure it will use the expected interface
         let msg = bytes::Bytes::copy_from_slice(&reply[..len]);
         let reply_dns = dns_message_parser::Dns::decode(msg);
@@ -266,16 +280,18 @@ async fn handle_request(
                     }
                     _ => (None, "N/A"),
                 };
-                debug!("DNS({}):{:?} {:?}", altnet_name, dns_addr, rr);
+                debug!("DNS({}):{:?} {:?}", req.altnet_name, req.dns_addr, rr);
                 if let Some(ipaddr) = addr {
                     let (reply_tx, reply_rx) = oneshot::channel();
-                    rt_tx.send(RTRequest::Query { ipaddr, reply_tx }).await?;
+                    req.rt_tx
+                        .send(RTRequest::Query { ipaddr, reply_tx })
+                        .await?;
                     if let Ok(Some(net_if)) = reply_rx.await {
-                        if route_through_if != net_if {
+                        if req.route_through_if != net_if {
                             let (reply_tx, reply_rx) = oneshot::channel();
-                            rt_tx
+                            req.rt_tx
                                 .send(RTRequest::QueryGw {
-                                    net_if: route_through_if.clone(),
+                                    net_if: req.route_through_if.clone(),
                                     ipaddr,
                                     reply_tx,
                                 })
@@ -285,20 +301,19 @@ async fn handle_request(
                                     "adding a route for {} ({}) via {:?}!",
                                     req_domain, ipaddr, gw_addr,
                                 );
-                                // Compute a time slot to expire this entry.
-                                // Every ten minutes, we drop all the routes that were created at least an hour ago.
-                                //
-                                // NOTE: Routes don't expire. We have no idea how long a connection may require them, how long the
-                                //       DNS entry will be cached (before we see it again), etc.
                                 if let Err(e) = update_route("add", ipaddr, gw_addr).await {
                                     warn!("failed to add route: {}", e);
                                 } else {
                                     info!(
                                         "routing {}:{} -> {} via {}({}) (NEW)",
-                                        qtype, req_domain, ipaddr, route_through_if, altnet_name
+                                        qtype,
+                                        req_domain,
+                                        ipaddr,
+                                        req.route_through_if,
+                                        req.altnet_name
                                     );
                                     let new_rt = RoutingTable::load_from_netstat().await?;
-                                    rt_tx.send(RTRequest::Replace(new_rt)).await?;
+                                    req.rt_tx.send(RTRequest::Replace(new_rt)).await?;
                                 }
                             } else {
                                 debug!("no route for {} {} -> {}!", qtype, req_domain, ipaddr)
@@ -306,7 +321,7 @@ async fn handle_request(
                         } else {
                             info!(
                                 "routing {}:{} -> {} via {}({})",
-                                qtype, req_domain, ipaddr, route_through_if, altnet_name,
+                                qtype, req_domain, ipaddr, req.route_through_if, req.altnet_name,
                             );
                         }
                     }
@@ -314,7 +329,9 @@ async fn handle_request(
             }
         }
     }
-    dns_reply_tx.send((reply[..len].to_owned(), addr)).await?;
+    req.dns_reply_tx
+        .send((reply[..len].to_owned(), req.addr))
+        .await?;
 
     Ok(())
 }
@@ -392,4 +409,28 @@ fn query_gateway(rt: &RoutingTable, net_if: &str, addr: &IpAddr) -> Option<IpAdd
                 .cloned()
         })
         .flatten()
+}
+
+struct UdpSocketPool;
+
+#[async_trait]
+impl deadpool::managed::Manager for UdpSocketPool {
+    type Type = UdpSocket;
+    type Error = anyhow::Error;
+
+    async fn create(&self) -> Result<UdpSocket> {
+        debug!("Creating socket");
+        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        socket::setsockopt(sock.as_raw_fd(), ReusePort, &true)?;
+        debug!("Sock: {:?}", sock);
+        Ok(sock)
+    }
+
+    async fn recycle(
+        &self,
+        _sock: &mut UdpSocket,
+    ) -> deadpool::managed::RecycleResult<anyhow::Error> {
+        debug!("Recycling socket");
+        Ok(())
+    }
 }

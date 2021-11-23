@@ -4,7 +4,6 @@ use futures::select;
 use log::*;
 use macos_routing_table::RoutingTable;
 use nix::sys::socket::{self, sockopt::ReusePort};
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
@@ -24,6 +23,9 @@ use udp_socket_pool::UdpSocketPool;
 mod rt_server;
 use rt_server::{rt_server, RTRequest};
 
+mod config;
+use config::{AltNet, Config};
+
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:53";
 const DEFAULT_DNS_ADDRESS: &str = "8.8.8.8:53";
 
@@ -31,14 +33,6 @@ const DEFAULT_DNS_ADDRESS: &str = "8.8.8.8:53";
 struct Opt {
     #[structopt(long, default_value = "dns-proxy.toml")]
     config: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Config {
-    bind_address: Option<SocketAddrV4>,
-    default_dns_address: Option<SocketAddrV4>,
-    default_network_interface: String,
-    alternate_networks: HashMap<String, AltNet>,
 }
 
 struct ProxyRequest {
@@ -52,19 +46,6 @@ struct ProxyRequest {
     dns_reply_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     addr: SocketAddr,
     sockpool: deadpool::managed::Pool<UdpSocketPool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AltNet {
-    // Domain suffixes
-    // TODO: maybe use a BTree if this list exceeds a given size
-    domains: Vec<String>,
-    // Address of DNS server to use for the specified domains
-    dns_address: SocketAddrV4,
-    // Interface through which traffic should be routed
-    network_interface: String,
-    // Optional host through which traffic should be routed (disables routing table lookup)
-    router: Option<IpAddr>,
 }
 
 #[tokio::main]

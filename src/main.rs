@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
 use futures::future::FutureExt;
 use futures::select;
 use log::*;
@@ -18,6 +17,9 @@ use tokio::{
     process::Command,
     sync::{mpsc, oneshot},
 };
+
+mod udp_socket_pool;
+use udp_socket_pool::UdpSocketPool;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:53";
 const DEFAULT_DNS_ADDRESS: &str = "8.8.8.8:53";
@@ -188,6 +190,7 @@ async fn dns_server<T: tokio::net::ToSocketAddrs + std::fmt::Debug>(
 ) -> Result<()> {
     debug!("Binding to {:?}", &bind_addr);
     let server_socket = UdpSocket::bind(bind_addr).await?;
+    socket::setsockopt(server_socket.as_raw_fd(), ReusePort, &true)?;
     info!("Bound to {:?}", server_socket.local_addr()?);
     let mut buf = vec![0u8; 512];
 
@@ -409,28 +412,4 @@ fn query_gateway(rt: &RoutingTable, net_if: &str, addr: &IpAddr) -> Option<IpAdd
                 .cloned()
         })
         .flatten()
-}
-
-struct UdpSocketPool;
-
-#[async_trait]
-impl deadpool::managed::Manager for UdpSocketPool {
-    type Type = UdpSocket;
-    type Error = anyhow::Error;
-
-    async fn create(&self) -> Result<UdpSocket> {
-        debug!("Creating socket");
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        socket::setsockopt(sock.as_raw_fd(), ReusePort, &true)?;
-        debug!("Sock: {:?}", sock);
-        Ok(sock)
-    }
-
-    async fn recycle(
-        &self,
-        _sock: &mut UdpSocket,
-    ) -> deadpool::managed::RecycleResult<anyhow::Error> {
-        debug!("Recycling socket");
-        Ok(())
-    }
 }

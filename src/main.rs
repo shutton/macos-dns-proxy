@@ -21,6 +21,9 @@ use tokio::{
 mod udp_socket_pool;
 use udp_socket_pool::UdpSocketPool;
 
+mod rt_server;
+use rt_server::{rt_server, RTRequest};
+
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:53";
 const DEFAULT_DNS_ADDRESS: &str = "8.8.8.8:53";
 
@@ -45,6 +48,7 @@ struct ProxyRequest {
     req_domain: Option<String>,
     rt_tx: mpsc::Sender<RTRequest>,
     route_through_if: String,
+    route_through_host: Option<IpAddr>,
     dns_reply_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     addr: SocketAddr,
     sockpool: deadpool::managed::Pool<UdpSocketPool>,
@@ -59,26 +63,8 @@ struct AltNet {
     dns_address: SocketAddrV4,
     // Interface through which traffic should be routed
     network_interface: String,
-}
-
-/// A routing table request
-#[derive(Debug)]
-enum RTRequest {
-    /// Replace the routing table with the one provided
-    Replace(RoutingTable),
-    /// Query the routing table for the given IP address to find the interface
-    /// currently handling that IP.  The response is sent back via the provided
-    /// oneshot channel.
-    Query {
-        ipaddr: IpAddr,
-        reply_tx: oneshot::Sender<Option<String>>,
-    },
-    // Query the gateway address for routing an address across a given interface
-    QueryGw {
-        net_if: String,
-        ipaddr: IpAddr,
-        reply_tx: oneshot::Sender<Option<IpAddr>>,
-    },
+    // Optional host through which traffic should be routed (disables routing table lookup)
+    router: Option<IpAddr>,
 }
 
 #[tokio::main]
@@ -113,13 +99,16 @@ async fn main() -> Result<()> {
 
     // Pull the current routing table
     let rt = RoutingTable::load_from_netstat().await?;
+    let (rt_tx, rt_rx) = mpsc::channel(32);
+    tokio::spawn(rt_server(rt_rx, rt));
 
     //
     // Ensure there's a route to DNS servers for alternative networks
     //
     for (net_name, altnet) in &config.alternate_networks {
         let dns_addr = IpAddr::from(*altnet.dns_address.ip());
-        if let Some(cur_if) = rt.find_gateway_netif(dns_addr) {
+        // Find the interface that handles this DNS address
+        if let Some(cur_if) = get_gw_netif(rt_tx.clone(), dns_addr).await? {
             if cur_if == altnet.network_interface {
                 info!(
                     "DNS requests for {} ({}) are already routed through {}",
@@ -134,15 +123,14 @@ async fn main() -> Result<()> {
                     altnet.dns_address.ip(),
                     altnet.network_interface
                 );
-                if let Some(gw_addr) = query_gateway(&rt, &altnet.network_interface, &dns_addr) {
+                if let Some(gw_addr) =
+                    get_gw_addr(rt_tx.clone(), &altnet.network_interface, dns_addr).await?
+                {
                     update_route("add", IpAddr::from(*altnet.dns_address.ip()), gw_addr).await?;
                 }
             }
         }
     }
-
-    let (rt_tx, rt_rx) = mpsc::channel(32);
-    tokio::spawn(rt_server(rt_rx, rt));
 
     let (dns_tx, mut dns_rx) = mpsc::channel(32);
     let (dns_reply_tx, dns_reply_rx) = mpsc::channel(32);
@@ -156,22 +144,23 @@ async fn main() -> Result<()> {
     loop {
         while let Some((request, addr)) = dns_rx.recv().await {
             debug!("Received {} bytes from {:?}", request.len(), addr);
-            let (dns_addr, altnet_name, route_through_if, req_domain) = inspect(
+            let result = inspect(
                 default_dns_address,
                 &default_net_if,
                 &config.alternate_networks,
                 &request,
             )?;
             let rt_tx = rt_tx.clone();
-            let altnet_name = altnet_name.to_string();
+            let altnet_name = result.net_name.to_string();
             let sockpool = sockpool.clone();
             tokio::spawn(handle_request(ProxyRequest {
-                dns_addr,
+                dns_addr: result.dns_address,
                 altnet_name,
                 request,
-                req_domain,
+                req_domain: result.domain_name,
                 rt_tx,
-                route_through_if: route_through_if.to_owned(),
+                route_through_if: result.net_if.to_owned(),
+                route_through_host: result.gw_addr.to_owned(),
                 dns_reply_tx: dns_reply_tx.clone(),
                 addr,
                 sockpool,
@@ -211,38 +200,6 @@ async fn dns_server<T: tokio::net::ToSocketAddrs + std::fmt::Debug>(
     }
 }
 
-/// The routing table server.  Holds a routing table, and performs queries
-/// against it, as well as allowing its replacement.
-async fn rt_server(mut rx: mpsc::Receiver<RTRequest>, mut rt: RoutingTable) -> Result<()> {
-    let mut cache = lru::LruCache::new(1024);
-    while let Some(query) = rx.recv().await {
-        match query {
-            RTRequest::Replace(new_rt) => {
-                rt = new_rt;
-                cache.clear();
-            }
-            RTRequest::Query { ipaddr, reply_tx } => {
-                let entry = cache.get(&ipaddr).or_else(|| rt.find_route_entry(ipaddr));
-                if let Some(entry) = entry {
-                    reply_tx.send(Some(entry.net_if.to_owned())).unwrap();
-                    let entry = entry.clone();
-                    cache.put(ipaddr, entry);
-                } else {
-                    reply_tx.send(None).unwrap();
-                }
-            }
-            RTRequest::QueryGw {
-                net_if,
-                ipaddr,
-                reply_tx,
-            } => {
-                reply_tx.send(query_gateway(&rt, &net_if, &ipaddr)).unwrap();
-            }
-        }
-    }
-    Ok(())
-}
-
 async fn handle_request(req: ProxyRequest) -> Result<()> {
     // Establish a local response port
     let local_server = req.sockpool.get().await.unwrap();
@@ -267,7 +224,7 @@ async fn handle_request(req: ProxyRequest) -> Result<()> {
             return Err(anyhow!("timeout"));
         };
 
-    if let Some(req_domain) = req.req_domain {
+    if let Some(req_domain) = &req.req_domain {
         // Now check the reply and make sure it will use the expected interface
         let msg = bytes::Bytes::copy_from_slice(&reply[..len]);
         let reply_dns = dns_message_parser::Dns::decode(msg);
@@ -285,21 +242,20 @@ async fn handle_request(req: ProxyRequest) -> Result<()> {
                 };
                 debug!("DNS({}):{:?} {:?}", req.altnet_name, req.dns_addr, rr);
                 if let Some(ipaddr) = addr {
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    req.rt_tx
-                        .send(RTRequest::Query { ipaddr, reply_tx })
-                        .await?;
-                    if let Ok(Some(net_if)) = reply_rx.await {
+                    // Check the routing table to find out what interface this host *currently* routes through
+                    if let Ok(Some(net_if)) = get_gw_netif(req.rt_tx.clone(), ipaddr).await {
                         if req.route_through_if != net_if {
-                            let (reply_tx, reply_rx) = oneshot::channel();
-                            req.rt_tx
-                                .send(RTRequest::QueryGw {
-                                    net_if: req.route_through_if.clone(),
-                                    ipaddr,
-                                    reply_tx,
-                                })
-                                .await?;
-                            if let Ok(Some(gw_addr)) = reply_rx.await {
+                            // The address for this host does not currently route through the desired interface. Find a host to do that
+                            let gw_addr = if let Some(gw_addr) = req.route_through_host {
+                                // Specified directly
+                                Some(gw_addr)
+                            } else {
+                                // Query the routing table for a host or default route
+                                get_gw_addr(req.rt_tx.clone(), &req.route_through_if, ipaddr)
+                                    .await?
+                            };
+
+                            if let Some(gw_addr) = gw_addr {
                                 debug!(
                                     "adding a route for {} ({}) via {:?}!",
                                     req_domain, ipaddr, gw_addr,
@@ -339,12 +295,20 @@ async fn handle_request(req: ProxyRequest) -> Result<()> {
     Ok(())
 }
 
+struct InspectResult<'a> {
+    dns_address: SocketAddrV4,
+    net_name: &'a str,
+    net_if: &'a str,
+    gw_addr: Option<IpAddr>,
+    domain_name: Option<String>,
+}
+
 fn inspect<'a>(
     default_dns_address: SocketAddrV4,
     default_net_if: &'a str,
     altnets: &'a HashMap<String, AltNet>,
     buf: &[u8],
-) -> Result<(SocketAddrV4, &'a str, &'a str, Option<String>)> {
+) -> Result<InspectResult<'a>> {
     debug!("Inspecting {:?}", buf);
     let msg = bytes::Bytes::copy_from_slice(buf);
     let query = dns_message_parser::Dns::decode(msg)?;
@@ -353,28 +317,31 @@ fn inspect<'a>(
     for question in query.questions {
         debug!("domain_name = {:?}", question.domain_name);
         let this_domain_name: String = question.domain_name.into();
-        for (altnet_name, altnet) in altnets {
+        for (net_name, altnet) in altnets {
             if altnet
                 .domains
                 .iter()
                 .any(|domain_name| this_domain_name.ends_with(domain_name))
             {
-                return Ok((
-                    altnet.dns_address,
-                    altnet_name,
-                    &altnet.network_interface,
-                    Some(this_domain_name),
-                ));
+                return Ok(InspectResult {
+                    dns_address: altnet.dns_address,
+                    net_name,
+                    net_if: &altnet.network_interface,
+                    gw_addr: altnet.router.to_owned(),
+                    domain_name: Some(this_domain_name),
+                });
             }
         }
         domain_name = Some(this_domain_name);
     }
 
-    Ok((default_dns_address, "default", default_net_if, domain_name))
-}
-
-fn ipaddr_same_proto(left: &IpAddr, right: &IpAddr) -> bool {
-    std::mem::discriminant(left) == std::mem::discriminant(right)
+    Ok(InspectResult {
+        dns_address: default_dns_address,
+        net_name: "default",
+        net_if: default_net_if,
+        gw_addr: None,
+        domain_name,
+    })
 }
 
 async fn update_route(operation: &str, dest: IpAddr, gw_addr: IpAddr) -> Result<()> {
@@ -401,15 +368,24 @@ async fn update_route(operation: &str, dest: IpAddr, gw_addr: IpAddr) -> Result<
     }
 }
 
-// Return a gateway address for the specified network interface that matches the
-// protocol of the provided IP address
-fn query_gateway(rt: &RoutingTable, net_if: &str, addr: &IpAddr) -> Option<IpAddr> {
-    rt.default_gateways_for_netif(net_if)
-        .map(|gw_addrs| {
-            gw_addrs
-                .iter()
-                .find(|gw_addr| ipaddr_same_proto(gw_addr, addr))
-                .cloned()
+async fn get_gw_addr(
+    rt_tx: mpsc::Sender<RTRequest>,
+    route_through_if: &str,
+    ipaddr: IpAddr,
+) -> Result<Option<IpAddr>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    rt_tx
+        .send(RTRequest::QueryDefaultGw {
+            net_if: route_through_if.to_owned(),
+            ipaddr,
+            reply_tx,
         })
-        .flatten()
+        .await?;
+    Ok(reply_rx.await?)
+}
+
+async fn get_gw_netif(rt_tx: mpsc::Sender<RTRequest>, ipaddr: IpAddr) -> Result<Option<String>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    rt_tx.send(RTRequest::Query { ipaddr, reply_tx }).await?;
+    Ok(reply_rx.await?)
 }

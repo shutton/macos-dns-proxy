@@ -71,3 +71,28 @@ fn query_gateway(rt: &RoutingTable, net_if: &str, addr: &IpAddr) -> Option<IpAdd
 fn ipaddr_same_proto(left: &IpAddr, right: &IpAddr) -> bool {
     std::mem::discriminant(left) == std::mem::discriminant(right)
 }
+
+pub async fn get_gw_addr(
+    rt_tx: mpsc::Sender<RTRequest>,
+    route_through_if: &str,
+    ipaddr: IpAddr,
+) -> Result<Option<IpAddr>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    rt_tx
+        .send(RTRequest::QueryDefaultGw {
+            net_if: route_through_if.to_owned(),
+            ipaddr,
+            reply_tx,
+        })
+        .await?;
+    Ok(reply_rx.await?)
+}
+
+pub async fn get_gw_netif(
+    rt_tx: mpsc::Sender<RTRequest>,
+    ipaddr: IpAddr,
+) -> Result<Option<String>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    rt_tx.send(RTRequest::Query { ipaddr, reply_tx }).await?;
+    Ok(reply_rx.await?)
+}

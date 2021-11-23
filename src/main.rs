@@ -7,10 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use structopt::StructOpt;
 use tokio::time::timeout;
-use tokio::{
-    process::Command,
-    sync::{mpsc, oneshot},
-};
+use tokio::{process::Command, sync::mpsc};
 
 mod dns_server;
 use dns_server::dns_server;
@@ -19,7 +16,7 @@ mod udp_socket_pool;
 use udp_socket_pool::UdpSocketPool;
 
 mod rt_server;
-use rt_server::{rt_server, RTRequest};
+use rt_server::{get_gw_addr, get_gw_netif, rt_server, RTRequest};
 
 mod config;
 use config::{AltNet, Config};
@@ -314,26 +311,4 @@ async fn update_route(operation: &str, dest: IpAddr, gw_addr: IpAddr) -> Result<
             stderr
         ))
     }
-}
-
-async fn get_gw_addr(
-    rt_tx: mpsc::Sender<RTRequest>,
-    route_through_if: &str,
-    ipaddr: IpAddr,
-) -> Result<Option<IpAddr>> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    rt_tx
-        .send(RTRequest::QueryDefaultGw {
-            net_if: route_through_if.to_owned(),
-            ipaddr,
-            reply_tx,
-        })
-        .await?;
-    Ok(reply_rx.await?)
-}
-
-async fn get_gw_netif(rt_tx: mpsc::Sender<RTRequest>, ipaddr: IpAddr) -> Result<Option<String>> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    rt_tx.send(RTRequest::Query { ipaddr, reply_tx }).await?;
-    Ok(reply_rx.await?)
 }

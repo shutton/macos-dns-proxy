@@ -1,13 +1,14 @@
 use anyhow::{anyhow, Result};
+use cidr::{AnyIpCidr, Ipv4Cidr, Ipv6Cidr};
 use log::*;
 use macos_routing_table::RoutingTable;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
-use std::process::Stdio;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use structopt::StructOpt;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tokio::{process::Command, sync::mpsc};
 
 mod dns_server;
 use dns_server::dns_server;
@@ -16,10 +17,14 @@ mod udp_socket_pool;
 use udp_socket_pool::UdpSocketPool;
 
 mod rt_server;
-use rt_server::{get_gw_addr, get_gw_netif, rt_server, RTRequest};
+use rt_server::{get_default_gw_addr, get_gw_netif, rt_server, update_route, RTRequest};
 
 mod config;
 use config::{AltNet, Config};
+
+use crate::rt_server::update_routing_table;
+
+mod openconnect;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:53";
 const DEFAULT_DNS_ADDRESS: &str = "8.8.8.8:53";
@@ -78,31 +83,47 @@ async fn main() -> Result<()> {
     let (rt_tx, rt_rx) = mpsc::channel(32);
     tokio::spawn(rt_server(rt_rx, rt));
 
-    //
-    // Ensure there's a route to DNS servers for alternative networks
-    //
     for (net_name, altnet) in &config.alternate_networks {
-        let dns_addr = IpAddr::from(*altnet.dns_address.ip());
+        let altnet_guard = altnet.read().unwrap();
+        // Is this network managed by a VPN?
+        if let Some(dyn_vpn) = &altnet_guard.dyn_vpn {
+            match dyn_vpn {
+                config::DynVpn::OpenConnect(_) => {
+                    openconnect::spawn(net_name.clone(), altnet.clone(), rt_tx.clone()).await?
+                }
+            }
+        }
+
+        //
+        // Ensure there's a route to DNS servers for alternative networks
+        //
+        let dns_addr = IpAddr::from(*altnet_guard.dns_address.ip());
         // Find the interface that handles this DNS address
         if let Some(cur_if) = get_gw_netif(rt_tx.clone(), dns_addr).await? {
-            if cur_if == altnet.network_interface {
+            if cur_if == altnet_guard.network_interface {
                 info!(
                     "DNS requests for {} ({}) are already routed through {}",
                     net_name,
-                    altnet.dns_address.ip(),
-                    altnet.network_interface
+                    altnet_guard.dns_address.ip(),
+                    altnet_guard.network_interface
                 );
             } else {
                 warn!(
                     "DNS requests for {} ({}) are NOT routed through {}",
                     net_name,
-                    altnet.dns_address.ip(),
-                    altnet.network_interface
+                    altnet_guard.dns_address.ip(),
+                    altnet_guard.network_interface
                 );
                 if let Some(gw_addr) =
-                    get_gw_addr(rt_tx.clone(), &altnet.network_interface, dns_addr).await?
+                    get_default_gw_addr(rt_tx.clone(), &altnet_guard.network_interface, dns_addr)
+                        .await?
                 {
-                    update_route("add", IpAddr::from(*altnet.dns_address.ip()), gw_addr).await?;
+                    update_route(
+                        "add",
+                        AnyIpCidr::V4(Ipv4Cidr::new_host(*altnet_guard.dns_address.ip())),
+                        gw_addr,
+                    )
+                    .await?;
                 }
             }
         }
@@ -196,11 +217,19 @@ async fn handle_request(req: ProxyRequest) -> Result<()> {
                                 Some(gw_addr)
                             } else {
                                 // Query the routing table for a host or default route
-                                get_gw_addr(req.rt_tx.clone(), &req.route_through_if, ipaddr)
-                                    .await?
+                                get_default_gw_addr(
+                                    req.rt_tx.clone(),
+                                    &req.route_through_if,
+                                    ipaddr,
+                                )
+                                .await?
                             };
 
                             if let Some(gw_addr) = gw_addr {
+                                let ipaddr = match ipaddr {
+                                    IpAddr::V4(addr) => AnyIpCidr::from(Ipv4Cidr::new_host(addr)),
+                                    IpAddr::V6(addr) => AnyIpCidr::from(Ipv6Cidr::new_host(addr)),
+                                };
                                 debug!(
                                     "adding a route for {} ({}) via {:?}!",
                                     req_domain, ipaddr, gw_addr,
@@ -216,8 +245,7 @@ async fn handle_request(req: ProxyRequest) -> Result<()> {
                                         req.route_through_if,
                                         req.altnet_name
                                     );
-                                    let new_rt = RoutingTable::load_from_netstat().await?;
-                                    req.rt_tx.send(RTRequest::Replace(new_rt)).await?;
+                                    update_routing_table(req.rt_tx.clone()).await?;
                                 }
                             } else {
                                 debug!("no route for {} {} -> {}!", qtype, req_domain, ipaddr)
@@ -240,10 +268,10 @@ async fn handle_request(req: ProxyRequest) -> Result<()> {
     Ok(())
 }
 
-struct InspectResult<'a> {
+struct InspectResult {
     dns_address: SocketAddrV4,
-    net_name: &'a str,
-    net_if: &'a str,
+    net_name: String,
+    net_if: String,
     gw_addr: Option<IpAddr>,
     domain_name: Option<String>,
 }
@@ -251,9 +279,9 @@ struct InspectResult<'a> {
 fn inspect<'a>(
     default_dns_address: SocketAddrV4,
     default_net_if: &'a str,
-    altnets: &'a HashMap<String, AltNet>,
+    altnets: &'a HashMap<String, Arc<RwLock<AltNet>>>,
     buf: &[u8],
-) -> Result<InspectResult<'a>> {
+) -> Result<InspectResult> {
     debug!("Inspecting {:?}", buf);
     let msg = bytes::Bytes::copy_from_slice(buf);
     let query = dns_message_parser::Dns::decode(msg)?;
@@ -263,6 +291,7 @@ fn inspect<'a>(
         debug!("domain_name = {:?}", question.domain_name);
         let this_domain_name: String = question.domain_name.into();
         for (net_name, altnet) in altnets {
+            let altnet = altnet.read().unwrap();
             if altnet
                 .domains
                 .iter()
@@ -270,9 +299,9 @@ fn inspect<'a>(
             {
                 return Ok(InspectResult {
                     dns_address: altnet.dns_address,
-                    net_name,
-                    net_if: &altnet.network_interface,
-                    gw_addr: altnet.router.to_owned(),
+                    net_name: net_name.into(),
+                    net_if: altnet.network_interface.clone(),
+                    gw_addr: altnet.router,
                     domain_name: Some(this_domain_name),
                 });
             }
@@ -282,33 +311,9 @@ fn inspect<'a>(
 
     Ok(InspectResult {
         dns_address: default_dns_address,
-        net_name: "default",
-        net_if: default_net_if,
+        net_name: "default".into(),
+        net_if: default_net_if.into(),
         gw_addr: None,
         domain_name,
     })
-}
-
-async fn update_route(operation: &str, dest: IpAddr, gw_addr: IpAddr) -> Result<()> {
-    let output = Command::new("/sbin/route")
-        .arg(operation)
-        .arg(format!("{}", dest))
-        .arg(gw_addr.to_string())
-        .stdout(Stdio::null())
-        .output()
-        .await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr =
-            String::from_utf8(output.stderr).unwrap_or_else(|_| "non-UTF-8 stderr".to_owned());
-        Err(anyhow!(
-            "route {} {:?} {:?} exited with {}, err: {}",
-            operation,
-            dest,
-            gw_addr,
-            output.status,
-            stderr
-        ))
-    }
 }

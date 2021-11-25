@@ -1,6 +1,10 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use cidr::{AnyIpCidr, Cidr};
+use log::debug;
 use macos_routing_table::RoutingTable;
 use std::net::IpAddr;
+use std::process::Stdio;
+use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
 /// A routing table request
@@ -14,6 +18,10 @@ pub enum RTRequest {
     Query {
         ipaddr: IpAddr,
         reply_tx: oneshot::Sender<Option<String>>,
+    },
+    QueryGw {
+        ipaddr: IpAddr,
+        reply_tx: oneshot::Sender<Option<IpAddr>>,
     },
     // Query the gateway address for routing an address across a given interface
     QueryDefaultGw {
@@ -48,7 +56,23 @@ pub async fn rt_server(mut rx: mpsc::Receiver<RTRequest>, mut rt: RoutingTable) 
                 ipaddr,
                 reply_tx,
             } => {
-                reply_tx.send(query_gateway(&rt, &net_if, &ipaddr)).unwrap();
+                reply_tx
+                    .send(query_default_gw(&rt, &net_if, &ipaddr))
+                    .unwrap();
+            }
+            RTRequest::QueryGw { ipaddr, reply_tx } => {
+                if let Some((entity, _)) = rt.find_gateway(ipaddr) {
+                    match entity {
+                        macos_routing_table::Entity::Cidr(cidr) => {
+                            if cidr.is_host_address() {
+                                reply_tx.send(Some(cidr.first_address().unwrap())).unwrap();
+                            } else {
+                                reply_tx.send(None).unwrap();
+                            }
+                        }
+                        _ => reply_tx.send(None).unwrap(),
+                    }
+                }
             }
         }
     }
@@ -57,7 +81,7 @@ pub async fn rt_server(mut rx: mpsc::Receiver<RTRequest>, mut rt: RoutingTable) 
 
 // Return a gateway address for the specified network interface that matches the
 // protocol of the provided IP address
-fn query_gateway(rt: &RoutingTable, net_if: &str, addr: &IpAddr) -> Option<IpAddr> {
+fn query_default_gw(rt: &RoutingTable, net_if: &str, addr: &IpAddr) -> Option<IpAddr> {
     rt.default_gateways_for_netif(net_if)
         .map(|gw_addrs| {
             gw_addrs
@@ -72,7 +96,13 @@ fn ipaddr_same_proto(left: &IpAddr, right: &IpAddr) -> bool {
     std::mem::discriminant(left) == std::mem::discriminant(right)
 }
 
-pub async fn get_gw_addr(
+pub async fn get_gw_addr(rt_tx: mpsc::Sender<RTRequest>, ipaddr: IpAddr) -> Result<Option<IpAddr>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    rt_tx.send(RTRequest::QueryGw { reply_tx, ipaddr }).await?;
+    Ok(reply_rx.await?)
+}
+
+pub async fn get_default_gw_addr(
     rt_tx: mpsc::Sender<RTRequest>,
     route_through_if: &str,
     ipaddr: IpAddr,
@@ -95,4 +125,52 @@ pub async fn get_gw_netif(
     let (reply_tx, reply_rx) = oneshot::channel();
     rt_tx.send(RTRequest::Query { ipaddr, reply_tx }).await?;
     Ok(reply_rx.await?)
+}
+
+pub async fn update_route(operation: &str, dest: AnyIpCidr, gw_addr: IpAddr) -> Result<()> {
+    let mut cmd = Command::new("/sbin/route");
+    cmd.arg(operation);
+    match dest {
+        AnyIpCidr::Any => todo!(),
+        AnyIpCidr::V4(dest) => {
+            if dest.is_host_address() {
+                cmd.arg("-host");
+                cmd.arg(format!("{}", dest.first_address()));
+            } else {
+                cmd.arg("-net");
+                cmd.arg(format!("{}", dest.first_address()));
+                cmd.arg("-netmask");
+                cmd.arg(format!("{}", dest.mask()));
+            }
+        }
+        AnyIpCidr::V6(_) => todo!(),
+    }
+    cmd.arg(gw_addr.to_string());
+    debug!("Executing {:?}", &cmd);
+    let output = cmd.stdout(Stdio::null()).output().await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr =
+            String::from_utf8(output.stderr).unwrap_or_else(|_| "non-UTF-8 stderr".to_owned());
+        Err(anyhow!(
+            "route {} {:?} {:?} exited with {}, err: {}",
+            operation,
+            dest,
+            gw_addr,
+            output.status,
+            stderr
+        ))
+    }
+}
+
+pub async fn update_routing_table(rt_tx: mpsc::Sender<RTRequest>) -> Result<()> {
+    let new_rt = RoutingTable::load_from_netstat()
+        .await
+        .map_err(|e| anyhow!("Unable to load new routing table: {}", e))?;
+    rt_tx
+        .send(RTRequest::Replace(new_rt))
+        .await
+        .map_err(|e| anyhow!("Unable to send new routing table: {}", e))?;
+    Ok(())
 }
